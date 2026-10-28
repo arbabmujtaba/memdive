@@ -1,0 +1,63 @@
+#!/bin/bash
+# memdive-helper: the root half of Memdive.
+#
+# Installed root-owned at /usr/local/libexec/memdive-helper by helper/install.sh
+# and run through pkexec. It takes exactly one argument, a depth from 1 to 5,
+# and touches nothing but kernel memory knobs, so polkit can allow it for the
+# active local session without a password.
+#
+#   1    drop the page cache                (fallback when cgroup reclaim is unavailable)
+#   2-3  drop page, dentry and inode caches
+#   4    as 3, then compact memory
+#   5    reclaim 25% of system services' memory, then as 4
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+umask 077
+
+MEMDIVE_HELPER_VERSION=2
+readonly MEMDIVE_HELPER_VERSION
+readonly CHUNK=$((128 * 1024 * 1024))
+readonly TIME_BUDGET=10
+
+level=${1:-}
+case $level in
+  1|2|3|4|5) ;;
+  --version) echo "$MEMDIVE_HELPER_VERSION"; exit 0 ;;
+  *) echo "usage: memdive-helper 1|2|3|4|5" >&2; exit 64 ;;
+esac
+
+stat_bytes() { awk -v k="$2" '$1 == k { print $2; exit }' "$1/memory.stat"; }
+
+# Proactive reclaim on a cgroup v2 group. Anonymous pages may only go to swap,
+# so never ask for more than half the free swap on top of the file cache.
+reclaim_pct() {
+  local cg=$1 pct=$2 anon file want swap_free done_bytes=0 step start=$SECONDS
+  [[ -w $cg/memory.reclaim && -r $cg/memory.stat ]] || return 0
+  anon=$(stat_bytes "$cg" anon); file=$(stat_bytes "$cg" file)
+  anon=${anon:-0}; file=${file:-0}
+  want=$(( (anon + file) * pct / 100 ))
+  swap_free=$(( $(awk '$1 == "SwapFree:" { print $2 }' /proc/meminfo) * 1024 ))
+  (( want > swap_free / 2 + file )) && want=$(( swap_free / 2 + file ))
+  while (( done_bytes < want )); do
+    step=$(( want - done_bytes < CHUNK ? want - done_bytes : CHUNK ))
+    echo "$step" > "$cg/memory.reclaim" 2>/dev/null || break
+    done_bytes=$(( done_bytes + step ))
+    (( SECONDS - start >= TIME_BUDGET )) && break
+  done
+}
+
+if (( level == 5 )); then
+  reclaim_pct /sys/fs/cgroup/system.slice 25
+fi
+
+sync
+if (( level == 1 )); then
+  echo 1 > /proc/sys/vm/drop_caches
+else
+  echo 3 > /proc/sys/vm/drop_caches
+fi
+
+# compact_memory only exists on kernels built with CONFIG_COMPACTION.
+if (( level >= 4 )) && [[ -w /proc/sys/vm/compact_memory ]]; then
+  echo 1 > /proc/sys/vm/compact_memory
+fi

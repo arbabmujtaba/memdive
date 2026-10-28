@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.arbabmujtaba.memdive",
+  "name": "Memdive",
+  "version": "1.0.0",
+  "author": "arbabmujtaba",
+  "license": "MIT",
+  "description": "Free RAM in one click. Pick a depth from Surface to Abyss, watch the porthole drain, and keep a hand-drawn dive log.",
+  "homepage": "https://github.com/arbabmujtaba/memdive",
+  "repository": "https://github.com/arbabmujtaba/memdive",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Memdive",
+    "description": "Memory ring in the bar; click to free RAM at depth 1-5.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "aliases": ["ram", "memory", "free ram", "ramfree"],
+    "defaults": {
+      "showPercent": false
+    },
+    "schema": [
+      {
+        "key": "showPercent",
+        "type": "boolean",
+        "label": "Show percentage",
+        "description": "Show the used-memory percentage next to the ring (horizontal bars only).",
+        "defaultValue": false
+      }
+    ]
+  }
+}

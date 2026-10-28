@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# memdive: free RAM at a chosen depth (1-5). Prints one JSON line.
+#
+#   1 Surface  rootless  reclaim 20% of your session's file cache
+#   2 Shallow  rootless  reclaim 10% of your session's memory (cold pages -> swap)
+#   3 Reef     root      Shallow + drop page, dentry and inode caches
+#   4 Deep     root      reclaim 25% of your session + drop caches + compact
+#   5 Abyss    root      reclaim 50% of your session + 25% of services + drop + compact
+#
+# Rootless steps write to the delegated cgroup v2 memory.reclaim of your
+# systemd user manager (user@UID.service). Root steps run
+# /usr/local/libexec/memdive-helper through pkexec. On kernels or setups
+# without cgroup reclaim, depths 1-2 fall back to the helper too.
+set -uo pipefail
+
+readonly HELPER=/usr/local/libexec/memdive-helper
+readonly HELPER_VERSION=2
+readonly CHUNK=$((128 * 1024 * 1024))
+readonly TIME_BUDGET=10
+readonly STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/memdive"
+readonly HISTORY="$STATE_DIR/history.jsonl"
+readonly HISTORY_KEEP=50
+
+die() {
+  printf '{"ok":false,"error":"%s"}\n' "$1"
+  exit "${2:-1}"
+}
+
+usage() {
+  cat <<'EOF'
+usage: memdive run <1-5>   free memory at the given depth (JSON result)
+       memdive caps        what this machine supports (JSON)
+       memdive levels      describe the depths
+EOF
+}
+
+mem_kib() { awk -v k="$1:" '$1 == k { print $2; exit }' /proc/meminfo; }
+cg_stat() { awk -v k="$2" '$1 == k { print $2; exit }' "$1/memory.stat" 2>/dev/null; }
+bool() { if "$@"; then echo true; else echo false; fi; }
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# The user manager's cgroup, found from our own cgroup v2 path so it works with
+# any slice layout. Falls back to the standard systemd location.
+user_cgroup() {
+  local uid path dir
+  uid=$(id -u)
+  path=$(awk -F: '$1 == "0" { print $3; exit }' /proc/self/cgroup 2>/dev/null)
+  if [[ $path == *"/user@$uid.service"* ]]; then
+    dir="/sys/fs/cgroup${path%%/user@"$uid".service*}/user@$uid.service"
+    [[ -d $dir ]] && { echo "$dir"; return; }
+  fi
+  echo "/sys/fs/cgroup/user.slice/user-$uid.slice/user@$uid.service"
+}
+
+# MEMDIVE_CGROUP overrides detection (used to test the no-reclaim fallback).
+CG=${MEMDIVE_CGROUP:-$(user_cgroup)}
+HAS_RECLAIM=false
+HAS_SWAPPINESS=false
+
+probe_reclaim() {
+  [[ -w $CG/memory.reclaim && -r $CG/memory.stat ]] || return 0
+  HAS_RECLAIM=true
+  # "swappiness=" landed in kernel 6.12. An old kernel rejects it with EINVAL;
+  # EAGAIN only means there was nothing to reclaim, so the key is understood.
+  local err
+  err=$({ echo "4096 swappiness=0" > "$CG/memory.reclaim"; } 2>&1) && { HAS_SWAPPINESS=true; return 0; }
+  [[ $err == *"Invalid argument"* ]] || HAS_SWAPPINESS=true
+}
+
+helper_state() {
+  if [[ ! -x $HELPER ]] || [[ $(stat -c %u "$HELPER" 2>/dev/null) != 0 ]]; then
+    echo missing
+  elif ! grep -q "^MEMDIVE_HELPER_VERSION=$HELPER_VERSION\$" "$HELPER" 2>/dev/null; then
+    echo outdated
+  else
+    echo installed
+  fi
+}
+
+# reclaim <bytes> [swappiness] -> prints bytes the user cgroup shrank by
+reclaim() {
+  local want=$1 swp=${2:-} done_bytes=0 step arg before after start=$SECONDS
+  before=$(<"$CG/memory.current")
+  while (( done_bytes < want )); do
+    step=$(( want - done_bytes < CHUNK ? want - done_bytes : CHUNK ))
+    arg=$step
+    [[ -n $swp ]] && arg="$step swappiness=$swp"
+    # EAGAIN: the kernel found nothing more to reclaim; stop there.
+    echo "$arg" > "$CG/memory.reclaim" 2>/dev/null || break
+    done_bytes=$(( done_bytes + step ))
+    (( SECONDS - start >= TIME_BUDGET )) && break
+  done
+  after=$(<"$CG/memory.current")
+  echo $(( before > after ? before - after : 0 ))
+}
+
+run_helper() {
+  local level=$1 state
+  state=$(helper_state)
+  if [[ $state != installed ]]; then echo "$state"; return; fi
+  has_cmd pkexec || { echo nopkexec; return; }
+  if pkexec "$HELPER" "$level" >/dev/null 2>&1; then echo ok; else echo denied; fi
+}
+
+record() {
+  mkdir -p "$STATE_DIR" || return 0
+  printf '{"t":%d,"level":%d,"freedKiB":%d,"helper":"%s"}\n' "$(date +%s)" "$1" "$2" "$3" >> "$HISTORY"
+  if (( $(wc -l < "$HISTORY") > HISTORY_KEEP * 2 )); then
+    tail -n "$HISTORY_KEEP" "$HISTORY" > "$HISTORY.tmp" && mv -f "$HISTORY.tmp" "$HISTORY"
+  fi
+}
+
+run_level() {
+  local level=$1 anon=0 file=0 want=0 swp="" swap_total swap_free_b user_freed=0 helper=none
+  local t0 free0 avail0 free1 avail1 ms freed gain
+  t0=$(date +%s%N)
+  free0=$(mem_kib MemFree)
+  avail0=$(mem_kib MemAvailable)
+  swap_total=$(mem_kib SwapTotal)
+  probe_reclaim
+
+  if [[ $HAS_RECLAIM == true ]]; then
+    anon=$(cg_stat "$CG" anon); file=$(cg_stat "$CG" file)
+    anon=${anon:-0}; file=${file:-0}
+    case $level in
+      1)
+        if [[ $HAS_SWAPPINESS == true ]]; then want=$(( file * 20 / 100 )); swp=0
+        elif (( swap_total == 0 )); then want=$(( file * 20 / 100 ))   # no swap: reclaim is file-only anyway
+        else want=$(( file * 10 / 100 ))
+        fi ;;
+      2|3) want=$(( (anon + file) * 10 / 100 )) ;;
+      4) want=$(( (anon + file) * 25 / 100 )) ;;
+      5) want=$(( (anon + file) * 50 / 100 )) ;;
+    esac
+    # Anonymous pages can only leave RAM through swap. Never ask for more than
+    # half the free swap on top of the file cache.
+    if [[ $swp != 0 ]]; then
+      swap_free_b=$(( $(mem_kib SwapFree) * 1024 ))
+      (( want > swap_free_b / 2 + file )) && want=$(( swap_free_b / 2 + file ))
+    fi
+    (( want > 0 )) && user_freed=$(reclaim "$want" "$swp")
+    (( level >= 3 )) && helper=$(run_helper "$level")
+  else
+    # No cgroup reclaim (cgroup v1, old kernel, no delegation): every depth
+    # goes through the helper.
+    helper=$(run_helper "$level")
+  fi
+  [[ $helper == ok ]] || sync
+
+  free1=$(mem_kib MemFree)
+  avail1=$(mem_kib MemAvailable)
+  ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+  freed=$(( free1 - free0 )); (( freed < 0 )) && freed=0
+  gain=$(( user_freed / 1024 > freed ? user_freed / 1024 : freed ))
+  record "$level" "$gain" "$helper"
+
+  printf '{"ok":true,"level":%d,"freedKiB":%d,"availableDeltaKiB":%d,"sessionReclaimedKiB":%d,"helper":"%s","rootless":%s,"ms":%d}\n' \
+    "$level" "$freed" "$(( avail1 - avail0 ))" "$(( user_freed / 1024 ))" "$helper" "$HAS_RECLAIM" "$ms"
+}
+
+caps() {
+  probe_reclaim
+  printf '{"reclaim":%s,"swappiness":%s,"swapKiB":%d,"helper":"%s","pkexec":%s,"compaction":%s,"history":"%s"}\n' \
+    "$HAS_RECLAIM" "$HAS_SWAPPINESS" "$(mem_kib SwapTotal)" "$(helper_state)" \
+    "$(bool has_cmd pkexec)" "$(bool test -e /proc/sys/vm/compact_memory)" "$HISTORY"
+}
+
+case ${1:-} in
+  run)
+    [[ ${2:-} =~ ^[1-5]$ ]] || die "depth must be 1-5" 64
+    exec 9>"${XDG_RUNTIME_DIR:-/tmp}/memdive-$(id -u).lock"
+    flock -n 9 || die "already running" 75
+    run_level "$2"
+    ;;
+  caps) caps ;;
+  levels) sed -n '4,8p' "$0" | sed 's/^# *//' ;;
+  -h|--help|help|"") usage ;;
+  *) usage >&2; exit 64 ;;
+esac
