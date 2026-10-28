@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# ramfree: free RAM at a chosen depth (1-5) and print one JSON result line.
+#
+#   1 Tidy      rootless  reclaim 20% of your session's file cache
+#   2 Light     rootless  reclaim 10% of your session's memory (idle pages -> zram)
+#   3 Standard  root      level 2 + drop page/dentry/inode caches
+#   4 Deep      root      reclaim 25% of session memory + drop caches + compact
+#   5 Max       root      reclaim 50% of session + 25% of system services + drop + compact
+#
+# Rootless steps write to the delegated cgroup memory.reclaim of user@UID.service.
+# Root steps run /usr/local/libexec/ramfree-helper through pkexec.
+set -uo pipefail
+
+readonly HELPER=/usr/local/libexec/ramfree-helper
+readonly CHUNK=$((128 * 1024 * 1024))
+readonly TIME_BUDGET=10
+
+die() {
+  printf '{"ok":false,"error":"%s"}\n' "$1"
+  exit "${2:-1}"
+}
+
+usage() {
+  cat <<'EOF'
+usage: ramfree run <1-5>     free memory at the given depth (JSON output)
+       ramfree levels        describe the levels
+       ramfree helper        report whether the root helper is installed
+EOF
+}
+
+mem_kib() { awk -v k="$1:" '$1 == k { print $2; exit }' /proc/meminfo; }
+
+cg_stat() { awk -v k="$2" '$1 == k { print $2; exit }' "$1/memory.stat"; }
+
+# reclaim <cgroup-dir> <bytes> [swappiness]  -> prints bytes actually reclaimed
+reclaim() {
+  local cg=$1 want=$2 swp=${3:-} start now done_bytes=0 step arg before after
+  [[ -w $cg/memory.reclaim ]] || { echo 0; return; }
+  before=$(<"$cg/memory.current")
+  start=$SECONDS
+  while (( done_bytes < want )); do
+    step=$(( want - done_bytes < CHUNK ? want - done_bytes : CHUNK ))
+    arg=$step
+    [[ -n $swp ]] && arg="$step swappiness=$swp"
+    # EAGAIN means the kernel could not find more to reclaim; stop there.
+    echo "$arg" > "$cg/memory.reclaim" 2>/dev/null || break
+    done_bytes=$(( done_bytes + step ))
+    now=$SECONDS
+    (( now - start >= TIME_BUDGET )) && break
+  done
+  after=$(<"$cg/memory.current")
+  echo $(( before > after ? before - after : 0 ))
+}
+
+user_cgroup() {
+  local uid
+  uid=$(id -u)
+  echo "/sys/fs/cgroup/user.slice/user-$uid.slice/user@$uid.service"
+}
+
+helper_state() {
+  if [[ -x $HELPER && $(stat -c %u "$HELPER") == 0 ]]; then echo installed; else echo missing; fi
+}
+
+run_level() {
+  local level=$1 cg anon file pct swp="" want swap_free_b user_freed=0 helper_status=none
+  local t0 free0 avail0 free1 avail1
+  t0=$(date +%s%N)
+  free0=$(mem_kib MemFree)
+  avail0=$(mem_kib MemAvailable)
+
+  cg=$(user_cgroup)
+  if [[ -w $cg/memory.reclaim ]]; then
+    anon=$(cg_stat "$cg" anon); file=$(cg_stat "$cg" file)
+    anon=${anon:-0}; file=${file:-0}
+    case $level in
+      1) want=$(( file * 20 / 100 )); swp=0 ;;
+      2|3) want=$(( (anon + file) * 10 / 100 )) ;;
+      4) want=$(( (anon + file) * 25 / 100 )) ;;
+      5) want=$(( (anon + file) * 50 / 100 )) ;;
+    esac
+    # Anonymous pages go to swap (zram here). Never ask for more than half of
+    # the free swap so the reclaim cannot push the system into swap exhaustion.
+    if [[ $swp != 0 ]]; then
+      swap_free_b=$(( $(mem_kib SwapFree) * 1024 ))
+      (( want > swap_free_b / 2 + file )) && want=$(( swap_free_b / 2 + file ))
+    fi
+    user_freed=$(reclaim "$cg" "$want" "$swp")
+  fi
+
+  if (( level >= 3 )); then
+    if [[ $(helper_state) == installed ]]; then
+      if pkexec "$HELPER" "$level" >/dev/null 2>&1; then
+        helper_status=ok
+      else
+        helper_status=denied
+      fi
+    else
+      sync
+      helper_status=missing
+    fi
+  fi
+
+  free1=$(mem_kib MemFree)
+  avail1=$(mem_kib MemAvailable)
+  local ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+  local freed=$(( free1 - free0 ))
+  (( freed < 0 )) && freed=0
+
+  printf '{"ok":true,"level":%d,"freedKiB":%d,"availableDeltaKiB":%d,"sessionReclaimedKiB":%d,"helper":"%s","ms":%d}\n' \
+    "$level" "$freed" "$(( avail1 - avail0 ))" "$(( user_freed / 1024 ))" "$helper_status" "$ms"
+}
+
+case ${1:-} in
+  run)
+    [[ ${2:-} =~ ^[1-5]$ ]] || die "level must be 1-5" 64
+    lock="${XDG_RUNTIME_DIR:-/tmp}/ramfree.lock"
+    exec 9>"$lock"
+    flock -n 9 || die "already running" 75
+    run_level "$2"
+    ;;
+  levels)
+    sed -n '4,8p' "$0" | sed 's/^# *//'
+    ;;
+  helper)
+    helper_state
+    ;;
+  -h|--help|help|"")
+    usage
+    ;;
+  *)
+    usage >&2
+    exit 64
+    ;;
+esac

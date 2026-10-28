@@ -1,0 +1,44 @@
+#!/bin/bash
+# ramfree-helper: root half of ramfree. Installed root-owned at
+# /usr/local/libexec/ramfree-helper and run via pkexec. Takes exactly one
+# argument (3, 4 or 5) and nothing else, so it is safe to allow without a
+# password prompt.
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin
+umask 077
+
+readonly CHUNK=$((128 * 1024 * 1024))
+readonly TIME_BUDGET=10
+
+level=${1:-}
+case $level in
+  3|4|5) ;;
+  *) echo "usage: ramfree-helper 3|4|5" >&2; exit 64 ;;
+esac
+
+reclaim_pct() {
+  local cg=$1 pct=$2 anon file want done_bytes=0 step start=$SECONDS swap_free
+  [[ -w $cg/memory.reclaim ]] || return 0
+  anon=$(awk '$1 == "anon" { print $2 }' "$cg/memory.stat")
+  file=$(awk '$1 == "file" { print $2 }' "$cg/memory.stat")
+  want=$(( (${anon:-0} + ${file:-0}) * pct / 100 ))
+  swap_free=$(( $(awk '$1 == "SwapFree:" { print $2 }' /proc/meminfo) * 1024 ))
+  (( want > swap_free / 2 + ${file:-0} )) && want=$(( swap_free / 2 + ${file:-0} ))
+  while (( done_bytes < want )); do
+    step=$(( want - done_bytes < CHUNK ? want - done_bytes : CHUNK ))
+    echo "$step" > "$cg/memory.reclaim" 2>/dev/null || break
+    done_bytes=$(( done_bytes + step ))
+    (( SECONDS - start >= TIME_BUDGET )) && break
+  done
+}
+
+if (( level == 5 )); then
+  reclaim_pct /sys/fs/cgroup/system.slice 25
+fi
+
+sync
+echo 3 > /proc/sys/vm/drop_caches
+
+if (( level >= 4 )); then
+  echo 1 > /proc/sys/vm/compact_memory
+fi

@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "id": "arch.ramfree",
+  "name": "RAM Free",
+  "version": "1.0.0",
+  "author": "arbabmujtaba",
+  "license": "MIT",
+  "description": "Memory ring in the bar with a popup that frees RAM at depth 1-5 in one click.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "RAM Free",
+    "description": "Shows memory use and frees RAM at a chosen depth (1-5) with one click.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "showPercent": false
+    },
+    "schema": [
+      {
+        "key": "showPercent",
+        "type": "boolean",
+        "label": "Show percentage",
+        "description": "Show the used-memory percentage next to the ring in the bar.",
+        "defaultValue": false
+      }
+    ]
+  },
+  "homepage": "https://github.com/arbabmujtaba/ramfree",
+  "repository": "https://github.com/arbabmujtaba/ramfree"
+}
